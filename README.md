@@ -128,3 +128,10 @@ interface Provider {
 ```
 
 Register in `server.ts` under the `providers` map.
+
+## Security TODO
+
+- [ ] **MCP auth bypass** — `/mcp` endpoint has no authentication and self-calls `/send` with the master API key (`server.ts:285-334`). Any localhost process can send Telegram notifications without credentials. Fix: add auth to `/mcp` or refactor `handleMcp` to call `handleSend` in-process.
+- [ ] **Error messages leak internals** — catch blocks return raw exception strings that may include Telegram bot token or stack traces (`server.ts:304,439`). Fix: return generic error to client, log details server-side.
+- [ ] **Non-constant-time API key comparison** — `===` instead of `crypto.timingSafeEqual()` (`server.ts:314`).
+- [ ] **No request body size limit** — `Bun.serve()` called without `maxRequestBodySize`. Add limit + validate `message.length`.
