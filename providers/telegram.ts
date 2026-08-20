@@ -2,6 +2,8 @@
  * providers/telegram.ts — Telegram Bot API provider
  */
 
+import type { ResolvedDestination } from "../destinations"
+
 export interface Provider {
   name: string
   send(message: string, options?: SendOptions): Promise<SendResult>
@@ -9,6 +11,12 @@ export interface Provider {
 
 export interface SendOptions {
   parse_mode?: "MarkdownV2" | "HTML"
+  /**
+   * Destination for this message. Typed as ResolvedDestination — which only
+   * destinations.resolveTarget() constructs — so a chat_id can never reach the
+   * Bot API without having passed the allowlist.
+   */
+  to?: ResolvedDestination
 }
 
 export interface SendResult {
@@ -27,12 +35,18 @@ export class TelegramProvider implements Provider {
   }
 
   async send(message: string, options?: SendOptions): Promise<SendResult> {
-    const body: Record<string, string> = {
-      chat_id: this.chatId,
+    // The constructor chatId stays as the fallback so callers predating the
+    // destination registry keep working untouched.
+    const body: Record<string, string | number> = {
+      chat_id: options?.to?.chat_id ?? this.chatId,
       text: message,
     }
     if (options?.parse_mode) {
       body.parse_mode = options.parse_mode
+    }
+    if (options?.to?.thread_id !== undefined) {
+      // Forum supergroups only; the Bot API wants a number here.
+      body.message_thread_id = options.to.thread_id
     }
 
     const res = await fetch(

@@ -13,6 +13,17 @@
 
 import { TelegramProvider, type Provider, type SendOptions } from "./providers/telegram"
 import { appendLog, cleanOldLogs, queryLogs } from "./logger"
+import {
+  DEFAULT_TARGET,
+  destinationNames,
+  listPublic,
+  loadDestinations,
+  resolveTarget,
+  type Destination,
+  type ResolvedDestination,
+} from "./destinations"
+import { composeDigest, queueKey, type QueuedMessage } from "./batch"
+import { buildTools } from "./tool-schema"
 
 // --- Config ---
 const PORT = parseInt(process.env.PORT ?? "8005")
@@ -20,9 +31,20 @@ const HOST = process.env.HOST ?? "127.0.0.1"
 const API_KEY = process.env.GOSSIP_API_KEY ?? ""
 const RATE_SOFT_RPM = parseInt(process.env.RATE_SOFT_RPM ?? "10")
 const RATE_HARD_RPM = parseInt(process.env.RATE_HARD_RPM ?? "50")
+// Per-destination guard, kept under Telegram's ~20 messages/minute per chat.
+const RATE_PER_DEST_RPM = parseInt(process.env.RATE_PER_DEST_RPM ?? "18")
 const BATCH_WINDOW_MS = parseInt(process.env.BATCH_WINDOW_MS ?? "30000")
 const BLOCK_ALERT_COOLDOWN_MS =
   parseInt(process.env.BLOCK_ALERT_COOLDOWN_MIN ?? "5") * 60 * 1000
+
+// Destinations reachable through the UNAUTHENTICATED /mcp endpoint. That route
+// self-calls /send with the master key, so without this the allowlist would let
+// anything that reaches nginx post into every configured group. Default keeps
+// the unauthenticated blast radius exactly what it was before this registry.
+const MCP_UNAUTH_TARGETS = (process.env.MCP_UNAUTH_TARGETS ?? DEFAULT_TARGET)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
 
 // --- Providers ---
 const telegram = new TelegramProvider(
@@ -35,6 +57,34 @@ const providers: Record<string, Provider> = {
 }
 const defaultProvider = "telegram"
 
+// --- Destination registry ---
+let destinations: Map<string, Destination> = new Map()
+let destinationErrors: string[] = []
+
+function reloadDestinations(): void {
+  const { registry, errors } = loadDestinations()
+  destinations = registry
+  destinationErrors = errors
+  for (const err of errors) {
+    console.error(`[gossip-gate] destinations: ${err}`)
+  }
+  console.log(
+    `[gossip-gate] ${registry.size} destination(s): ${destinationNames(registry).join(", ") || "none"}`
+  )
+}
+
+reloadDestinations()
+
+// A typo here would silently delete the alert telling you the gateway is on
+// fire, so fall back to the default destination at startup instead.
+let ALERT_TARGET = process.env.ALERT_TARGET?.trim() || DEFAULT_TARGET
+if (!resolveTarget(destinations, ALERT_TARGET)) {
+  console.error(
+    `[gossip-gate] ALERT_TARGET "${ALERT_TARGET}" is not a configured destination — falling back to "${DEFAULT_TARGET}"`
+  )
+  ALERT_TARGET = DEFAULT_TARGET
+}
+
 // --- State ---
 let paused = false
 type Mode = "direct" | "batch" | "blocked"
@@ -42,34 +92,49 @@ let currentMode: Mode = "direct"
 
 // Rate limiting: sliding window (per minute)
 const requestTimestamps: number[] = []
+// Per-destination windows, keyed like the batch queues.
+const destTimestamps = new Map<string, number[]>()
 
-// Batch queue
-interface QueuedMessage {
-  message: string
-  options?: SendOptions
-  provider: string
-}
-const batchQueue: QueuedMessage[] = []
+// Batch queues — one per provider+destination. Never merged: a shared queue
+// would render one group's messages into another group's digest.
+const queues = new Map<string, QueuedMessage[]>()
+// A single timer for every queue. One timer per key would leak timers and race
+// N flushes to Telegram at once; the cost is that a queue opened late rides an
+// earlier timer, which only ever makes a digest arrive sooner.
 let batchTimer: ReturnType<typeof setTimeout> | null = null
 
 // Block alert state
 let blockAlertLastSent: number | null = null
 
 // --- Rate limiter ---
-function recordRequest(): void {
+function trim(list: number[], cutoff: number): void {
+  while (list.length > 0 && list[0]! < cutoff) list.shift()
+}
+
+function recordRequest(key: string): void {
   const now = Date.now()
-  requestTimestamps.push(now)
-  // Trim old entries
   const cutoff = now - 60_000
-  while (requestTimestamps.length > 0 && requestTimestamps[0]! < cutoff) {
-    requestTimestamps.shift()
+
+  requestTimestamps.push(now)
+  trim(requestTimestamps, cutoff)
+
+  let perDest = destTimestamps.get(key)
+  if (!perDest) {
+    perDest = []
+    destTimestamps.set(key, perDest)
   }
+  perDest.push(now)
+  trim(perDest, cutoff)
 }
 
 function currentRpm(): number {
-  const now = Date.now()
-  const cutoff = now - 60_000
+  const cutoff = Date.now() - 60_000
   return requestTimestamps.filter((t) => t >= cutoff).length
+}
+
+function destRpm(key: string): number {
+  const cutoff = Date.now() - 60_000
+  return (destTimestamps.get(key) ?? []).filter((t) => t >= cutoff).length
 }
 
 function updateMode(): void {
@@ -86,13 +151,29 @@ function updateMode(): void {
   }
 }
 
+/**
+ * Mode for one destination: the global mode, escalated to batch when this
+ * destination alone is hot.
+ *
+ * The per-destination guard deliberately stops at `batch` and never reaches
+ * `blocked` — blocking protects the service, and making that tier per-target
+ * would let a runaway loop rotate targets to stay under every window forever.
+ */
+function effectiveMode(key: string): Mode {
+  if (currentMode === "blocked") return "blocked"
+  if (currentMode === "batch") return "batch"
+  return destRpm(key) >= RATE_PER_DEST_RPM ? "batch" : "direct"
+}
+
 // --- Critical alert (bypasses everything) ---
 async function sendCritical(message: string): Promise<void> {
+  const to = resolveTarget(destinations, ALERT_TARGET) ?? undefined
   try {
-    const result = await telegram.send(message)
+    const result = await telegram.send(message, { to })
     await appendLog({
       ts: new Date().toISOString(),
       provider: "telegram",
+      target: ALERT_TARGET,
       message,
       mode: "direct",
       status: "critical_alert",
@@ -131,50 +212,42 @@ setInterval(() => {
 }, 30_000)
 
 // --- Batch flush ---
-function scheduleBatchFlush(): void {
-  if (batchTimer !== null) return
-  batchTimer = setTimeout(flushBatch, BATCH_WINDOW_MS)
+function queuedTotal(): number {
+  let total = 0
+  for (const items of queues.values()) total += items.length
+  return total
 }
 
-async function flushBatch(): Promise<void> {
-  batchTimer = null
-  if (batchQueue.length === 0) return
+function scheduleBatchFlush(): void {
+  if (batchTimer !== null) return
+  batchTimer = setTimeout(flushAll, BATCH_WINDOW_MS)
+}
 
-  const items = batchQueue.splice(0)
-  const providerName = items[0]!.provider
+async function flushOne(key: string, items: QueuedMessage[]): Promise<void> {
+  const first = items[0]!
+  const providerName = first.provider
   const provider = providers[providerName] ?? telegram
-
-  const MAX_SHOWN = 8
-  const shown = items.slice(0, MAX_SHOWN)
-  const overflow = items.length - MAX_SHOWN
-
-  let batchMsg =
-    `[GossipGate] ${items.length} message${items.length !== 1 ? "s" : ""} in the last ${Math.round(BATCH_WINDOW_MS / 1000)}s:\n`
-
-  for (const item of shown) {
-    const truncated =
-      item.message.length > 80 ? item.message.slice(0, 77) + "…" : item.message
-    batchMsg += `- "${truncated}"\n`
-  }
-  if (overflow > 0) {
-    batchMsg += `(+ ${overflow} more)`
-  }
+  const digest = composeDigest(items, BATCH_WINDOW_MS)
+  const to: ResolvedDestination = { name: first.target, chat_id: first.chat_id }
+  if (first.thread_id !== undefined) to.thread_id = first.thread_id
 
   try {
-    const result = await provider.send(batchMsg)
+    // No parse_mode: see composeDigest.
+    const result = await provider.send(digest, { to })
     await appendLog({
       ts: new Date().toISOString(),
       provider: providerName,
-      message: batchMsg,
+      target: first.target,
+      message: digest,
       mode: "batch",
       status: "batched",
       messageId: result.messageId,
     })
-    // Log each individual queued message as "batched"
     for (const item of items) {
       await appendLog({
         ts: new Date().toISOString(),
         provider: item.provider,
+        target: item.target,
         message: item.message,
         mode: "batch",
         status: "queued",
@@ -182,56 +255,53 @@ async function flushBatch(): Promise<void> {
       })
     }
   } catch (e) {
-    console.error("[gossip-gate] Batch flush failed:", e)
+    // /send already answered {ok:true, mode:"queued"} for these, so a silent
+    // console.error would leave no trace that they were dropped.
+    console.error(`[gossip-gate] Batch flush failed for ${key}:`, e)
+    for (const item of items) {
+      await appendLog({
+        ts: new Date().toISOString(),
+        provider: item.provider,
+        target: item.target,
+        message: item.message,
+        mode: "batch",
+        status: "failed",
+        messageId: null,
+      })
+    }
   }
 }
 
+async function flushAll(): Promise<void> {
+  batchTimer = null
 
-// --- MCP Tool definitions (shared with HTTP MCP endpoint) ---
-const MCP_TOOLS = [
-  {
-    name: "send_notification",
-    description: `Send a notification via GossipGate to the configured channel (default: Telegram).
-Supports rich Telegram formatting — PREFER formatted messages over boring plain text!
+  for (const [key, items] of [...queues.entries()]) {
+    if (items.length === 0) {
+      queues.delete(key)
+      continue
+    }
+    // Splice per key inside its own try/catch: one destination throwing (bot
+    // removed from the group, topic closed, chat migrated) must not abandon the
+    // other queues, whose items are already out of the array.
+    const batch = items.splice(0)
+    await flushOne(key, batch)
+    if (queues.get(key)?.length === 0) queues.delete(key)
+  }
 
-FORMATTING OPTIONS (parse_mode: "MarkdownV2"):
-  *bold text*          → bold
-  _italic text_        → italic
-  \`inline code\`       → monospace
-  \`\`\`language         → code block
-  code here
-  \`\`\`
-  [link text](url)     → hyperlink
-  ||spoiler text||     → spoiler
+  // Anything enqueued while we were awaiting Telegram needs its own window.
+  if (queuedTotal() > 0) scheduleBatchFlush()
+}
 
-IMPORTANT: In MarkdownV2, these chars MUST be escaped with \\:
-  . ! - + = | { } ( ) # > ~ [ ]
 
-EXAMPLES of good messages:
-  "🚀 *Deploy completed\\!* Build \`#42\` is live\\."
-  "⚠️ *Alert:* Service \`whisper\\-api\` is _unresponsive_\\."
-  "✅ Task done\\! Check [results](https://example\\.com)"`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        message: {
-          type: "string",
-          description: "Message content (plain text or formatted)",
-        },
-        parse_mode: {
-          type: "string",
-          enum: ["MarkdownV2", "HTML"],
-          description: "Telegram formatting mode. Use MarkdownV2 for rich messages.",
-        },
-        provider: {
-          type: "string",
-          description: "Target provider (default: telegram)",
-        },
-      },
-      required: ["message"],
-    },
-  },
-]
+// --- MCP tool definitions ---
+// The schema itself lives in tool-schema.ts, shared with the stdio server in
+// mcp/server.ts so the two transports cannot drift apart.
+//
+// This route is unauthenticated, so it only ever advertises — and only ever
+// accepts — the destinations in MCP_UNAUTH_TARGETS.
+function unauthTargets(): string[] {
+  return MCP_UNAUTH_TARGETS.filter((name) => destinations.has(name))
+}
 
 // --- HTTP MCP handler (POST /mcp) ---
 async function handleMcp(req: Request): Promise<Response> {
@@ -252,7 +322,7 @@ async function handleMcp(req: Request): Promise<Response> {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "gossip-gate", version: "1.0.0" },
+        serverInfo: { name: "gossip-gate", version: "0.2.0" },
       },
     })
   }
@@ -262,7 +332,7 @@ async function handleMcp(req: Request): Promise<Response> {
   }
 
   if (method === "tools/list") {
-    return Response.json({ jsonrpc: "2.0", id, result: { tools: MCP_TOOLS } })
+    return Response.json({ jsonrpc: "2.0", id, result: { tools: buildTools(unauthTargets()) } })
   }
 
   if (method === "tools/call") {
@@ -277,12 +347,26 @@ async function handleMcp(req: Request): Promise<Response> {
       return Response.json({ jsonrpc: "2.0", id, error: { code: -32602, message: "message is required" } })
     }
 
-    const sendBody: Record<string, string> = { message: toolArgs.message }
+    const target = toolArgs.target?.trim() || DEFAULT_TARGET
+    if (!MCP_UNAUTH_TARGETS.includes(target)) {
+      return Response.json({
+        jsonrpc: "2.0", id,
+        result: {
+          content: [{
+            type: "text",
+            text: `Refused: target "${target}" is not reachable over the unauthenticated MCP endpoint. Allowed here: ${MCP_UNAUTH_TARGETS.join(", ")}. Use the authenticated /send endpoint for other destinations.`,
+          }],
+          isError: true,
+        },
+      })
+    }
+
+    const sendBody: Record<string, string> = { message: toolArgs.message, target }
     if (toolArgs.parse_mode) sendBody.parse_mode = toolArgs.parse_mode
     if (toolArgs.provider) sendBody.provider = toolArgs.provider
 
     try {
-      const res = await fetch("http://127.0.0.1:8005/send", {
+      const res = await fetch(`http://127.0.0.1:${PORT}/send`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Api-Key": API_KEY },
         body: JSON.stringify(sendBody),
@@ -297,11 +381,12 @@ async function handleMcp(req: Request): Promise<Response> {
       return Response.json({
         jsonrpc: "2.0", id,
         result: {
-          content: [{ type: "text", text: `Notification sent (${data.mode}). MessageId: ${data.messageId ?? "queued"}` }],
+          content: [{ type: "text", text: `Notification sent to "${target}" (${data.mode}). MessageId: ${data.messageId ?? "queued"}` }],
         },
       })
     } catch (e) {
-      return Response.json({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${e}` } })
+      console.error("[gossip-gate] MCP send failed:", e)
+      return Response.json({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error" } })
     }
   }
 
@@ -324,6 +409,8 @@ async function handleRequest(req: Request): Promise<Response> {
     return Response.json({
       status: paused ? "paused" : "ok",
       mode: currentMode,
+      destinations_loaded: destinations.size,
+      destinations_errors: destinationErrors.length,
     })
   }
 
@@ -342,7 +429,17 @@ async function handleRequest(req: Request): Promise<Response> {
     return handleSend(req)
   }
 
+  if (path === "/destinations" && req.method === "GET") {
+    return Response.json({
+      destinations: listPublic(destinations),
+      errors: destinationErrors,
+    })
+  }
+
   if (path === "/status" && req.method === "GET") {
+    const perQueue: Record<string, number> = {}
+    for (const [key, items] of queues) perQueue[key] = items.length
+
     return Response.json({
       paused,
       mode: currentMode,
@@ -350,8 +447,10 @@ async function handleRequest(req: Request): Promise<Response> {
         rpm: currentRpm(),
         soft_limit: RATE_SOFT_RPM,
         hard_limit: RATE_HARD_RPM,
+        per_destination_limit: RATE_PER_DEST_RPM,
       },
-      queue_size: batchQueue.length,
+      queue_size: queuedTotal(),
+      queues: perQueue,
     })
   }
 
@@ -373,7 +472,14 @@ async function handleRequest(req: Request): Promise<Response> {
 }
 
 async function handleSend(req: Request): Promise<Response> {
-  let body: { message?: string; provider?: string; parse_mode?: string }
+  let body: {
+    message?: string
+    provider?: string
+    parse_mode?: string
+    target?: string
+    chat_id?: unknown
+    message_thread_id?: unknown
+  }
   try {
     body = await req.json()
   } catch {
@@ -384,30 +490,64 @@ async function handleSend(req: Request): Promise<Response> {
     return Response.json({ error: "message is required" }, { status: 400 })
   }
 
+  // Telegram caps text at 4096 characters — fail with a clear 400 rather than
+  // relaying the provider's 502.
+  if (body.message.length > 4096) {
+    return Response.json({ error: "message too long (max 4096 characters)" }, { status: 400 })
+  }
+
+  // Reject rather than ignore, so callers get a clear signal and no later
+  // refactor can quietly start honouring a caller-supplied chat.
+  if (body.chat_id !== undefined || body.message_thread_id !== undefined) {
+    return Response.json(
+      { error: 'Raw chat_id is not accepted. Use "target" with a configured destination name.' },
+      { status: 400 }
+    )
+  }
+
   const providerName = body.provider ?? defaultProvider
   const provider = providers[providerName]
   if (!provider) {
     return Response.json({ error: `Unknown provider: ${providerName}` }, { status: 400 })
   }
 
-  const options: SendOptions = {}
+  const targetName = body.target?.trim() || DEFAULT_TARGET
+  const to = resolveTarget(destinations, targetName)
+  if (!to) {
+    return Response.json(
+      {
+        error: `Unknown target: ${targetName}`,
+        available: destinationNames(destinations),
+      },
+      { status: 400 }
+    )
+  }
+
+  const options: SendOptions = { to }
   if (body.parse_mode === "MarkdownV2" || body.parse_mode === "HTML") {
     options.parse_mode = body.parse_mode
   }
 
-  recordRequest()
-  updateMode()
+  const key = queueKey(providerName, to.name)
 
   if (paused) {
     return Response.json({ error: "Service paused" }, { status: 503 })
   }
 
-  const mode = currentMode
+  recordRequest(key)
+  updateMode()
+
+  const queue = queues.get(key)
+  // Drain-first: once a destination has a queue, everything for it keeps
+  // queueing even after the mode relaxes. Otherwise a message queued at T could
+  // be delivered after one sent directly at T+1s, breaking per-group ordering.
+  const mode = queue && queue.length > 0 ? "batch" : effectiveMode(key)
 
   if (mode === "blocked") {
     await appendLog({
       ts: new Date().toISOString(),
       provider: providerName,
+      target: to.name,
       message: body.message,
       mode: "blocked",
       status: "blocked",
@@ -417,9 +557,26 @@ async function handleSend(req: Request): Promise<Response> {
   }
 
   if (mode === "batch") {
-    batchQueue.push({ message: body.message, options, provider: providerName })
+    const item: QueuedMessage = {
+      message: body.message,
+      options,
+      provider: providerName,
+      target: to.name,
+      chat_id: to.chat_id,
+    }
+    if (to.thread_id !== undefined) item.thread_id = to.thread_id
+
+    if (queue) queue.push(item)
+    else queues.set(key, [item])
+
     scheduleBatchFlush()
-    return Response.json({ ok: true, provider: providerName, messageId: null, mode: "queued" })
+    return Response.json({
+      ok: true,
+      provider: providerName,
+      target: to.name,
+      messageId: null,
+      mode: "queued",
+    })
   }
 
   // Direct send
@@ -428,15 +585,32 @@ async function handleSend(req: Request): Promise<Response> {
     await appendLog({
       ts: new Date().toISOString(),
       provider: providerName,
+      target: to.name,
       message: body.message,
       mode: "direct",
       status: "sent",
       messageId: result.messageId,
     })
-    return Response.json({ ok: true, provider: providerName, messageId: result.messageId, mode: "direct" })
+    return Response.json({
+      ok: true,
+      provider: providerName,
+      target: to.name,
+      messageId: result.messageId,
+      mode: "direct",
+    })
   } catch (e) {
+    // Details stay server-side: the exception carries the raw Telegram response.
     console.error("[gossip-gate] Send failed:", e)
-    return Response.json({ error: "Send failed", detail: String(e) }, { status: 502 })
+    await appendLog({
+      ts: new Date().toISOString(),
+      provider: providerName,
+      target: to.name,
+      message: body.message,
+      mode: "direct",
+      status: "failed",
+      messageId: null,
+    })
+    return Response.json({ error: "Send failed" }, { status: 502 })
   }
 }
 
@@ -445,18 +619,62 @@ async function handleLogs(url: URL): Promise<Response> {
   let from = url.searchParams.get("date") ?? url.searchParams.get("from") ?? today
   let to = url.searchParams.get("date") ?? url.searchParams.get("to") ?? today
 
-  const entries = await queryLogs(from, to)
-  return Response.json({ entries, count: entries.length, period: { from, to } })
+  let entries = await queryLogs(from, to)
+
+  const target = url.searchParams.get("target")
+  if (target) {
+    // Entries written before the registry existed have no target and were all
+    // bound for the default destination.
+    entries = entries.filter((e) =>
+      target === DEFAULT_TARGET ? (e.target ?? DEFAULT_TARGET) === target : e.target === target
+    )
+  }
+
+  return Response.json({
+    entries,
+    count: entries.length,
+    period: { from, to },
+    ...(target ? { target } : {}),
+  })
 }
 
 // --- Startup ---
 cleanOldLogs()
 
+// Adding a destination is a config edit; SIGHUP avoids a restart, and queued
+// items carry their resolved chat_id so a reload cannot misroute them.
+process.on("SIGHUP", () => {
+  console.log("[gossip-gate] SIGHUP — reloading destinations")
+  reloadDestinations()
+})
+
+// systemd stop would otherwise discard the queues silently.
+let shuttingDown = false
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+  if (batchTimer !== null) clearTimeout(batchTimer)
+  if (queuedTotal() > 0) {
+    console.log(`[gossip-gate] draining ${queuedTotal()} queued message(s) before exit`)
+    try {
+      await flushAll()
+    } catch (e) {
+      console.error("[gossip-gate] drain on shutdown failed:", e)
+    }
+  }
+  process.exit(0)
+}
+process.on("SIGTERM", shutdown)
+process.on("SIGINT", shutdown)
+
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
+  // Bounds the request body; message length is validated in handleSend.
+  maxRequestBodySize: 1024 * 1024,
   fetch: handleRequest,
 })
 
 console.log(`[gossip-gate] Listening on http://${HOST}:${PORT}`)
-console.log(`[gossip-gate] Rate limits: soft=${RATE_SOFT_RPM} rpm, hard=${RATE_HARD_RPM} rpm`)
+console.log(`[gossip-gate] Rate limits: soft=${RATE_SOFT_RPM} rpm, hard=${RATE_HARD_RPM} rpm, per-destination=${RATE_PER_DEST_RPM} rpm`)
+console.log(`[gossip-gate] Unauthenticated /mcp targets: ${MCP_UNAUTH_TARGETS.join(", ")}`)

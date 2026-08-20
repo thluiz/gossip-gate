@@ -10,6 +10,8 @@
 import { existsSync, readFileSync } from "fs"
 import { join } from "path"
 
+import { buildTools } from "../tool-schema"
+
 const GOSSIP_GATE_URL = process.env.GOSSIP_GATE_URL ?? "http://127.0.0.1:8005"
 
 // Load API key from .env if not in environment
@@ -45,59 +47,45 @@ interface MCPResponse {
   error?: { code: number; message: string }
 }
 
-const TOOLS = [
-  {
-    name: "send_notification",
-    description: `Send a notification via GossipGate to the configured channel (default: Telegram).
-Supports rich Telegram formatting — PREFER formatted messages over boring plain text!
+// Destination names for the `target` enum. Fetched from the gateway rather than
+// read off disk: the gateway is what enforces the allowlist, and GOSSIP_GATE_URL
+// may point at another host, so a local file could advertise names /send would
+// then reject.
+let cachedNames: string[] = []
+let cachedAt = 0
+const NAMES_TTL_MS = 60_000
 
-FORMATTING OPTIONS (parse_mode: "MarkdownV2"):
-  *bold text*          → bold
-  _italic text_        → italic
-  \`inline code\`       → monospace
-  \`\`\`language         → code block
-  code here
-  \`\`\`
-  [link text](url)     → hyperlink
-  ||spoiler text||     → spoiler
+async function fetchDestinationNames(): Promise<string[]> {
+  if (Date.now() - cachedAt < NAMES_TTL_MS) return cachedNames
 
-IMPORTANT: In MarkdownV2, these chars MUST be escaped with \\:
-  . ! - + = | { } ( ) # > ~ [ ]
-
-EXAMPLES of good messages:
-  "🚀 *Deploy completed\\!* Build \`#42\` is live\\."
-  "⚠️ *Alert:* Service \`whisper\\-api\` is _unresponsive_\\."
-  "✅ Task done\\! Check [results](https://example\\.com)"`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        message: {
-          type: "string",
-          description: "Message content (plain text or formatted)",
-        },
-        parse_mode: {
-          type: "string",
-          enum: ["MarkdownV2", "HTML"],
-          description: "Telegram formatting mode. Use MarkdownV2 for rich messages.",
-        },
-        provider: {
-          type: "string",
-          description: "Target provider (default: telegram)",
-        },
-      },
-      required: ["message"],
-    },
-  },
-]
+  try {
+    const res = await fetch(`${GOSSIP_GATE_URL}/destinations`, {
+      headers: { "X-Api-Key": API_KEY },
+      // A hung fetch here would stall the MCP handshake and make Claude Code
+      // mark the whole server dead, breaking send_notification everywhere. An
+      // enum-free schema is a far cheaper failure.
+      signal: AbortSignal.timeout(2000),
+    })
+    if (!res.ok) return cachedNames
+    const data = (await res.json()) as { destinations?: Array<{ name: string }> }
+    cachedNames = (data.destinations ?? []).map((d) => d.name)
+    cachedAt = Date.now()
+  } catch {
+    // Gateway down or slow — keep whatever we had, possibly nothing.
+  }
+  return cachedNames
+}
 
 async function callSend(
   message: string,
   parse_mode?: string,
-  provider?: string
-): Promise<{ ok: boolean; messageId: number | null; mode: string; error?: string }> {
+  provider?: string,
+  target?: string
+): Promise<{ ok: boolean; messageId: number | null; mode: string; target?: string; error?: string }> {
   const body: Record<string, string> = { message }
   if (parse_mode) body.parse_mode = parse_mode
   if (provider) body.provider = provider
+  if (target) body.target = target
 
   const res = await fetch(`${GOSSIP_GATE_URL}/send`, {
     method: "POST",
@@ -110,9 +98,20 @@ async function callSend(
 
   const data = await res.json() as Record<string, unknown>
   if (!res.ok) {
-    return { ok: false, messageId: null, mode: "error", error: String(data.error ?? "Unknown error") }
+    const available = Array.isArray(data.available) ? ` Available: ${(data.available as string[]).join(", ")}.` : ""
+    return {
+      ok: false,
+      messageId: null,
+      mode: "error",
+      error: String(data.error ?? "Unknown error") + available,
+    }
   }
-  return { ok: true, messageId: data.messageId as number | null, mode: data.mode as string }
+  return {
+    ok: true,
+    messageId: data.messageId as number | null,
+    mode: data.mode as string,
+    target: data.target as string | undefined,
+  }
 }
 
 function respond(id: number | string, result: unknown): void {
@@ -132,13 +131,13 @@ async function handleRequest(req: MCPRequest): Promise<void> {
     respond(id, {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "gossip-gate", version: "1.0.0" },
+      serverInfo: { name: "gossip-gate", version: "0.2.0" },
     })
     return
   }
 
   if (method === "tools/list") {
-    respond(id, { tools: TOOLS })
+    respond(id, { tools: buildTools(await fetchDestinationNames()) })
     return
   }
 
@@ -157,13 +156,18 @@ async function handleRequest(req: MCPRequest): Promise<void> {
     }
 
     try {
-      const result = await callSend(toolArgs.message, toolArgs.parse_mode, toolArgs.provider)
+      const result = await callSend(
+        toolArgs.message,
+        toolArgs.parse_mode,
+        toolArgs.provider,
+        toolArgs.target
+      )
       if (result.ok) {
         respond(id, {
           content: [
             {
               type: "text",
-              text: `Notification sent via ${result.mode} mode. MessageId: ${result.messageId ?? "queued"}`,
+              text: `Notification sent to "${result.target ?? "default"}" via ${result.mode} mode. MessageId: ${result.messageId ?? "queued"}`,
             },
           ],
         })
@@ -189,8 +193,20 @@ async function handleRequest(req: MCPRequest): Promise<void> {
 
 // stdin line-by-line reader
 let buffer = ""
+
+// Requests are chained rather than awaited inline: handleRequest is async (it
+// may fetch destination names), so responses must stay ordered and stdin
+// closing must not exit the process while one is still in flight.
+let pending: Promise<void> = Promise.resolve()
+
+function enqueue(req: MCPRequest): void {
+  pending = pending.then(() => handleRequest(req)).catch((e) => {
+    console.error("[gossip-gate-mcp] handler failed:", e)
+  })
+}
+
 process.stdin.setEncoding("utf8")
-process.stdin.on("data", async (chunk: string) => {
+process.stdin.on("data", (chunk: string) => {
   buffer += chunk
   const lines = buffer.split("\n")
   buffer = lines.pop() ?? ""
@@ -198,12 +214,13 @@ process.stdin.on("data", async (chunk: string) => {
     const trimmed = line.trim()
     if (!trimmed) continue
     try {
-      const req = JSON.parse(trimmed) as MCPRequest
-      await handleRequest(req)
+      enqueue(JSON.parse(trimmed) as MCPRequest)
     } catch {
       // ignore parse errors
     }
   }
 })
 
-process.stdin.on("end", () => process.exit(0))
+process.stdin.on("end", () => {
+  pending.finally(() => process.exit(0))
+})

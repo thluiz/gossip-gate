@@ -2,6 +2,75 @@
 
 All notable changes to GossipGate are documented in this file.
 
+## [0.2.0] — 2026-08-20
+
+Send to named Telegram groups, channels and forum topics — not just one chat.
+
+### Destinations
+
+- **Named destination registry** (`destinations.json`) — messages are addressed
+  by name (`target`), never by raw chat id. `chat_id` / `message_thread_id` in a
+  request body are rejected with a 400
+- **Forum topics** — a destination may carry a `thread_id` to post into one
+  topic of a supergroup
+- **Backward compatible** — `default` falls back to `TELEGRAM_CHAT_ID`, so
+  callers that pass no `target` are unaffected. A missing or malformed
+  `destinations.json` degrades to default-only instead of failing startup
+- `GET /destinations` — names and descriptions only, never chat ids
+- `SIGHUP` reloads the registry without a restart; `SIGTERM` drains the queues
+  before exit
+
+### Fixed
+
+- **Batch mode leaked messages between destinations** — the queue was global and
+  the flush sent every queued message to whichever destination came first. Queues
+  are now per `provider:target` and flush independently, each in its own
+  try/catch so one failing destination cannot abandon the others
+- **The audit log only ever kept the day's last entry** — `Bun.write()` silently
+  ignores `{ append: true }` and truncated the file on every write. Now uses
+  `appendFile`
+- **Batched messages lost their formatting** — queued `parse_mode` was dropped at
+  flush. Digests are now deliberately plain text, with MarkdownV2 escapes and
+  HTML tags normalized away; inheriting one item's `parse_mode` would make the
+  others' unescaped text fail Telegram validation and lose the whole batch
+- **Dropped batches and failed sends left no audit trail** — both now log
+  `status: "failed"`
+- **A paused service still accumulated rate** and could fire critical alerts
+  about traffic it was not sending
+- Error responses no longer echo raw exception strings to the client
+- `Bun.serve()` now sets `maxRequestBodySize`, and `message` is capped at
+  Telegram's 4096 characters
+
+### Rate limiting
+
+- **Per-destination soft limit** (`RATE_PER_DEST_RPM`, default 18, under
+  Telegram's ~20/min per chat) escalates a single hot destination to batch mode.
+  The hard limit stays global — it protects the service, and a per-target block
+  tier could be evaded by rotating targets
+- `/status` reports per-queue depth; `/health` reports destination count and
+  config errors
+
+### Security
+
+- `MCP_UNAUTH_TARGETS` (default `default`) caps which destinations the
+  unauthenticated `/mcp` route can reach, keeping its blast radius unchanged now
+  that groups are configurable. See the Security TODO in the README
+
+### MCP
+
+- `send_notification` gained a `target` parameter, advertised as an enum of
+  configured names. The stdio server fetches them from `GET /destinations` with
+  a 2s timeout, falling back to an enum-free schema — a hung fetch during
+  `tools/list` would otherwise stall the handshake and kill the tool everywhere
+- The tool schema was duplicated verbatim in both transports; it now lives in
+  `tool-schema.ts`
+
+### Tests
+
+- First test suite (`bun test`): destination resolution and validation
+  (including prototype-key lookups), and batch keying, digest composition and
+  plain-text normalization
+
 ## [0.1.0] — 2026-02-27
 
 Initial release of GossipGate notification gateway.

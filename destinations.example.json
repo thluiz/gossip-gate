@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "Copy to destinations.json (gitignored) and fill in real ids.",
+    "Names must match ^[a-z0-9][a-z0-9_-]{0,31}$ — no ':' (it is the batch queue separator).",
+    "chat_id: numeric id, or @publicchannelname. Add the bot to the group FIRST;",
+    "a bot that is not a member gets 'Bad Request: chat not found'.",
+    "Basic groups have ids like -5076421920. Supergroups and channels are prefixed",
+    "with -100 (e.g. -1001234567890) — do not add that prefix yourself, read the real",
+    "id from the chat. Promoting a group to a supergroup CHANGES its id.",
+    "thread_id: optional, forum supergroups only, targets one topic.",
+    "'default' is optional — without it, TELEGRAM_CHAT_ID is used."
+  ],
+
+  "alertas-infra": {
+    "chat_id": "-1001234567890",
+    "description": "infra alerts supergroup"
+  },
+  "deploys": {
+    "chat_id": "-1001234567890",
+    "thread_id": 42,
+    "description": "the Deploys topic inside the infra supergroup"
+  }
+}

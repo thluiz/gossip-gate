@@ -4,13 +4,16 @@
 
 import { join } from "path"
 import { existsSync, readdirSync, unlinkSync, mkdirSync } from "fs"
+import { appendFile } from "fs/promises"
 
 export interface LogEntry {
   ts: string
   provider: string
+  /** Destination alias — never the chat_id, so the audit log is not the leak. */
+  target?: string
   message: string
   mode: "direct" | "batch" | "blocked"
-  status: "sent" | "queued" | "batched" | "blocked" | "critical_alert"
+  status: "sent" | "queued" | "batched" | "blocked" | "critical_alert" | "failed"
   messageId: number | null
 }
 
@@ -44,7 +47,9 @@ export async function appendLog(entry: LogEntry): Promise<void> {
     : entry.message
 
   const line = JSON.stringify({ ...entry, message: truncated }) + "\n"
-  await Bun.write(Bun.file(logFilePath(today)), line, { append: true } as any)
+  // Bun.write() silently ignores { append: true } and truncates the file, which
+  // left only the day's last entry on disk. appendFile actually appends.
+  await appendFile(logFilePath(today), line, "utf8")
 }
 
 export function cleanOldLogs(): void {
