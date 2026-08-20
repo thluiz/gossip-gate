@@ -211,6 +211,10 @@ keeps the allowlist structural rather than a convention.
 - [ ] **Non-constant-time API key comparison** — `===` instead of
   `crypto.timingSafeEqual()`.
 - [x] **Error messages leak internals** — `/send` and `/mcp` now return generic
-  errors; details go to the server log.
+  errors; details go to the server log. The bot token is scrubbed from provider
+  errors before they get there: a failed `fetch` carries the request URL, which
+  embeds the token, so logging the raw error wrote it to the journal in clear
+  text. **Any token used before this fix should be rotated** — journal entries
+  from failed sends still contain it.
 - [x] **No request body size limit** — `Bun.serve()` sets `maxRequestBodySize`,
   and `message.length` is capped at Telegram's 4096.

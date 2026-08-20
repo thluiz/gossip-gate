@@ -49,21 +49,35 @@ export class TelegramProvider implements Provider {
       body.message_thread_id = options.to.thread_id
     }
 
-    const res = await fetch(
-      `https://api.telegram.org/bot${this.token}/sendMessage`,
-      {
+    let res: Response
+    try {
+      res = await fetch(`https://api.telegram.org/bot${this.token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      }
-    )
+      })
+    } catch (e) {
+      // A fetch failure (DNS, connection refused) carries the request URL on the
+      // error object, and that URL contains the bot token — logging the raw
+      // error writes the token to the journal in clear text. Rethrow a plain
+      // Error so only the scrubbed message survives.
+      throw new Error(`Telegram request failed: ${this.redact(asMessage(e))}`)
+    }
 
     if (!res.ok) {
       const err = await res.text()
-      throw new Error(`Telegram API error ${res.status}: ${err}`)
+      throw new Error(`Telegram API error ${res.status}: ${this.redact(err)}`)
     }
 
     const data = (await res.json()) as { result: { message_id: number } }
     return { messageId: data.result.message_id }
   }
+
+  private redact(text: string): string {
+    return this.token ? text.split(this.token).join("<redacted>") : text
+  }
+}
+
+function asMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
