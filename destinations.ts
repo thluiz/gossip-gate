@@ -13,6 +13,13 @@ export interface Destination {
   name: string
   chat_id: string
   thread_id?: number
+  /**
+   * Which bot posts here. Omitted means the default bot, so every destination
+   * that existed before multi-bot support keeps behaving exactly as it did.
+   * The name maps to a TELEGRAM_BOT_TOKEN_<NAME> in the environment — the token
+   * itself never enters this file, which is a registry, not a secret store.
+   */
+  bot?: string
   description?: string
 }
 
@@ -25,6 +32,12 @@ export interface ResolvedDestination {
   name: string
   chat_id: string
   thread_id?: number
+  /**
+   * Travels with the destination for the same reason chat_id does: a caller
+   * cannot name a bot in the request body, only a destination, so the choice of
+   * identity is always the registry's and never the caller's.
+   */
+  bot?: string
 }
 
 export interface LoadResult {
@@ -39,6 +52,9 @@ export const DEFAULT_TARGET = "default"
 // so an alias containing ':' could collide across keys.
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
 const CHAT_ID_RE = /^(-?\d+|@[A-Za-z0-9_]{4,31})$/
+// A bot name becomes part of an environment variable, so keep it to the
+// characters that survive that trip unambiguously.
+const BOT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
 
 function defaultPath(): string {
   return process.env.GOSSIP_DESTINATIONS_PATH || join(import.meta.dir, "destinations.json")
@@ -70,6 +86,15 @@ function validateEntry(name: string, value: unknown, errors: string[]): Destinat
       return null
     }
     dest.thread_id = t
+  }
+
+  if (raw.bot !== undefined) {
+    const bot = typeof raw.bot === "string" ? raw.bot.trim() : ""
+    if (!BOT_NAME_RE.test(bot)) {
+      errors.push(`destination "${name}": bot must match ${BOT_NAME_RE.source}`)
+      return null
+    }
+    dest.bot = bot
   }
 
   if (typeof raw.description === "string") dest.description = raw.description
@@ -146,9 +171,15 @@ export function resolveTarget(
   const dest = registry.get(key)
   if (!dest) return null
 
-  return dest.thread_id !== undefined
-    ? { name: dest.name, chat_id: dest.chat_id, thread_id: dest.thread_id }
-    : { name: dest.name, chat_id: dest.chat_id }
+  const resolved: ResolvedDestination = { name: dest.name, chat_id: dest.chat_id }
+  if (dest.thread_id !== undefined) resolved.thread_id = dest.thread_id
+  if (dest.bot !== undefined) resolved.bot = dest.bot
+  return resolved
+}
+
+/** Bot names referenced by the registry, for validation against the loaded tokens. */
+export function referencedBots(registry: Map<string, Destination>): string[] {
+  return [...new Set([...registry.values()].map((d) => d.bot).filter((b): b is string => !!b))]
 }
 
 export function destinationNames(registry: Map<string, Destination>): string[] {

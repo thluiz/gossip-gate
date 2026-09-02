@@ -18,6 +18,7 @@ import {
   destinationNames,
   listPublic,
   loadDestinations,
+  referencedBots,
   resolveTarget,
   type Destination,
   type ResolvedDestination,
@@ -47,9 +48,28 @@ const MCP_UNAUTH_TARGETS = (process.env.MCP_UNAUTH_TARGETS ?? DEFAULT_TARGET)
   .filter(Boolean)
 
 // --- Providers ---
+/**
+ * Extra bots come from TELEGRAM_BOT_TOKEN_<NAME>, and a destination opts into
+ * one with "bot": "<name>". Tokens stay in the environment, never in
+ * destinations.json: that file is a registry of where to post, not of what to
+ * post as, and it is read (and backed up) more casually than a secret should be.
+ */
+function loadBotTokens(): Map<string, string> {
+  const bots = new Map<string, string>()
+  for (const [key, value] of Object.entries(process.env)) {
+    const match = /^TELEGRAM_BOT_TOKEN_(.+)$/.exec(key)
+    if (!match || !value?.trim()) continue
+    bots.set(match[1]!.toLowerCase(), value.trim())
+  }
+  return bots
+}
+
+const botTokens = loadBotTokens()
+
 const telegram = new TelegramProvider(
   process.env.TELEGRAM_BOT_TOKEN ?? "",
-  process.env.TELEGRAM_CHAT_ID ?? ""
+  process.env.TELEGRAM_CHAT_ID ?? "",
+  botTokens
 )
 
 const providers: Record<string, Provider> = {
@@ -63,6 +83,19 @@ let destinationErrors: string[] = []
 
 function reloadDestinations(): void {
   const { registry, errors } = loadDestinations()
+
+  // A destination naming a bot with no token loaded would silently post as the
+  // default bot instead — the wrong identity in the right chat, which is worse
+  // than a message that fails. Say it out loud on every load.
+  for (const bot of referencedBots(registry)) {
+    if (!telegram.hasBot(bot)) {
+      errors.push(
+        `bot "${bot}" is referenced by a destination but TELEGRAM_BOT_TOKEN_${bot.toUpperCase()} is not set — ` +
+          "those messages will go out as the default bot"
+      )
+    }
+  }
+
   destinations = registry
   destinationErrors = errors
   for (const err of errors) {
@@ -71,6 +104,9 @@ function reloadDestinations(): void {
   console.log(
     `[gossip-gate] ${registry.size} destination(s): ${destinationNames(registry).join(", ") || "none"}`
   )
+  if (telegram.botNames().length) {
+    console.log(`[gossip-gate] extra bot(s): ${telegram.botNames().join(", ")}`)
+  }
 }
 
 reloadDestinations()
@@ -230,6 +266,10 @@ async function flushOne(key: string, items: QueuedMessage[]): Promise<void> {
   const digest = composeDigest(items, BATCH_WINDOW_MS)
   const to: ResolvedDestination = { name: first.target, chat_id: first.chat_id }
   if (first.thread_id !== undefined) to.thread_id = first.thread_id
+  // Carried on the queued item for the same reason chat_id is: a digest must go
+  // out as the bot the destination had when the message was accepted, even if
+  // the registry was reloaded in between.
+  if (first.bot !== undefined) to.bot = first.bot
 
   try {
     // No parse_mode: see composeDigest.
@@ -565,6 +605,7 @@ async function handleSend(req: Request): Promise<Response> {
       chat_id: to.chat_id,
     }
     if (to.thread_id !== undefined) item.thread_id = to.thread_id
+    if (to.bot !== undefined) item.bot = to.bot
 
     if (queue) queue.push(item)
     else queues.set(key, [item])

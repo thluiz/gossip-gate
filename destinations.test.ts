@@ -15,6 +15,7 @@ import {
   destinationNames,
   listPublic,
   loadDestinations,
+  referencedBots,
   resolveTarget,
 } from "./destinations"
 
@@ -161,6 +162,50 @@ describe("failure modes stay non-fatal", () => {
     const { registry, errors } = load([{ chat_id: "-1" }])
     expect(destinationNames(registry)).toEqual(["default"])
     expect(errors.join()).toContain("expected a JSON object")
+  })
+})
+
+describe("per-destination bot", () => {
+  test("is carried through resolution", () => {
+    const { registry } = load({ oficina: { chat_id: "-536", bot: "jaci" } })
+    expect(resolveTarget(registry, "oficina")).toEqual({
+      name: "oficina",
+      chat_id: "-536",
+      bot: "jaci",
+    })
+  })
+
+  test("is absent when not configured, so the default bot is used", () => {
+    const { registry } = load({ plain: { chat_id: "-1" } })
+    expect(resolveTarget(registry, "plain")).toEqual({ name: "plain", chat_id: "-1" })
+  })
+
+  test("an invalid bot name fails the destination instead of silently ignoring it", () => {
+    // Silently dropping the field would post as the default bot: the right chat
+    // with the wrong identity, which is worse than not posting.
+    const { registry, errors } = load({ bad: { chat_id: "-1", bot: "Jaci Bot!" } })
+    expect(destinationNames(registry)).toEqual(["default"])
+    expect(errors.join()).toContain('destination "bad": bot must match')
+  })
+
+  test("a non-string bot is rejected too", () => {
+    const { registry } = load({ bad: { chat_id: "-1", bot: 7 } })
+    expect(destinationNames(registry)).toEqual(["default"])
+  })
+
+  test("referencedBots lists each bot once, ignoring destinations without one", () => {
+    const { registry } = load({
+      a: { chat_id: "-1", bot: "jaci" },
+      b: { chat_id: "-2", bot: "jaci" },
+      c: { chat_id: "-3" },
+      d: { chat_id: "-4", bot: "outro" },
+    })
+    expect(referencedBots(registry).sort()).toEqual(["jaci", "outro"])
+  })
+
+  test("a bot name never leaks a token, because the registry holds none", () => {
+    const { registry } = load({ oficina: { chat_id: "-536", bot: "jaci" } })
+    expect(JSON.stringify([...registry.values()])).not.toContain(":AA")
   })
 })
 

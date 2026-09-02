@@ -8,6 +8,9 @@
     "with -100 (e.g. -1001234567890) — do not add that prefix yourself, read the real",
     "id from the chat. Promoting a group to a supergroup CHANGES its id.",
     "thread_id: optional, forum supergroups only, targets one topic.",
+    "bot: optional, name of an extra bot from TELEGRAM_BOT_TOKEN_<NAME>. Without it,",
+    "the default bot posts. The token never goes in this file. THAT bot is the one",
+    "that has to be a member of the chat.",
     "'default' is optional — without it, TELEGRAM_CHAT_ID is used."
   ],
 
@@ -19,5 +22,10 @@
     "chat_id": "-1001234567890",
     "thread_id": 42,
     "description": "the Deploys topic inside the infra supergroup"
+  },
+  "grupo-do-agente": {
+    "chat_id": "-5076421920",
+    "bot": "jaci",
+    "description": "posts as the agent's own bot, which is the one in that group"
   }
 }

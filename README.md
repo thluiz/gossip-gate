@@ -137,6 +137,12 @@ in `destinations.json` (gitignored — copy `destinations.example.json`):
   have.
 - Names must match `^[a-z0-9][a-z0-9_-]{0,31}$`.
 - `thread_id` targets a single topic inside a forum supergroup.
+- `bot` picks which bot posts, by name: the token comes from
+  `TELEGRAM_BOT_TOKEN_<NAME>` in the environment, never from this file. Without
+  it, the default bot posts. Use it when the chat already belongs to another bot
+  — adding the default bot to that group instead would widen what it can read.
+  A destination naming a bot with no token loaded is reported in
+  `destinations_errors` and falls back to the default bot.
 - An invalid entry is skipped with a log line; it never stops the service.
   Check `GET /destinations` or `GET /health` (`destinations_errors`).
 - `SIGHUP` (`systemctl reload`) re-reads the file without a restart.

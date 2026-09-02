@@ -20,6 +20,8 @@ export interface QueuedMessage {
    */
   chat_id: string
   thread_id?: number
+  /** Resolved at enqueue time too, so a digest cannot go out as the wrong bot. */
+  bot?: string
 }
 
 const MAX_SHOWN = 8

@@ -28,13 +28,31 @@ export class TelegramProvider implements Provider {
 
   private readonly token: string
   private readonly chatId: string
+  /** Extra bots, by name. A destination picks one; everything else uses the default. */
+  private readonly bots: Map<string, string>
 
-  constructor(token: string, chatId: string) {
+  constructor(token: string, chatId: string, bots?: Map<string, string>) {
     this.token = token
     this.chatId = chatId
+    this.bots = bots ?? new Map()
+  }
+
+  /** Bot names available besides the default one. */
+  botNames(): string[] {
+    return [...this.bots.keys()]
+  }
+
+  hasBot(name: string): boolean {
+    return this.bots.has(name)
   }
 
   async send(message: string, options?: SendOptions): Promise<SendResult> {
+    // An unknown bot falls back to the default one rather than throwing: the
+    // registry is validated at load time, so reaching here with an unknown name
+    // means a message would otherwise be dropped for a config problem already
+    // reported at startup.
+    const token = (options?.to?.bot && this.bots.get(options.to.bot)) || this.token
+
     // The constructor chatId stays as the fallback so callers predating the
     // destination registry keep working untouched.
     const body: Record<string, string | number> = {
@@ -51,7 +69,7 @@ export class TelegramProvider implements Provider {
 
     let res: Response
     try {
-      res = await fetch(`https://api.telegram.org/bot${this.token}/sendMessage`, {
+      res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -73,8 +91,18 @@ export class TelegramProvider implements Provider {
     return { messageId: data.result.message_id }
   }
 
+  /**
+   * Scrubs every token, not just the one used for this call. A failed fetch
+   * carries the request URL, and the URL carries the token; with several bots
+   * loaded, redacting only the default would print another bot's token into the
+   * journal the first time that bot got a 403.
+   */
   private redact(text: string): string {
-    return this.token ? text.split(this.token).join("<redacted>") : text
+    let out = text
+    for (const token of [this.token, ...this.bots.values()]) {
+      if (token) out = out.split(token).join("<redacted>")
+    }
+    return out
   }
 }
 
