@@ -1,3 +1,5 @@
 .env
 logs/
 destinations.json
+# local backups of .env / destinations.json made before edits
+*.bak-*
